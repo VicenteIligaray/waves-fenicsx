@@ -92,7 +92,7 @@ def penetrable_circle(k0, k1, rad, plot_grid):
     npts = np.size(fem_xx, 0)
     a = rad
 
-    n_terms = np.max([100, np.int(55 + (k0 * a)**1.01)])
+    n_terms = np.max([100, int(55 + (k0 * a)**1.01)])
 
     Nx = plot_grid.shape[1]
     Ny = plot_grid.shape[2]

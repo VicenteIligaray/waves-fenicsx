@@ -19,9 +19,9 @@ import numpy as np
 import matplotlib.pyplot as plt
 import dolfinx
 
-from dolfinx import Function, FunctionSpace, RectangleMesh, geometry
+from dolfinx import fem, mesh, io, geometry
+from dolfinx.fem.petsc import LinearProblem
 from dolfinx.io import XDMFFile
-from dolfinx.cpp.mesh import CellType
 from ufl import (dx, grad, inner, TestFunction, TrialFunction)
 from mpi4py import MPI
 from petsc4py import PETSc
@@ -71,11 +71,12 @@ h_elem = wave_len / n_wave
 n_elem = int(np.round(dim_x/h_elem))
 
 # Create mesh
-mesh = RectangleMesh(MPI.COMM_WORLD,
-                     [np.array([-dim_x/2, -dim_x/2, 0]),
-                      np.array([dim_x/2, dim_x/2, 0])],
+mesh = mesh.create_rectangle(MPI.COMM_WORLD,
+                     [np.array([-dim_x/2, -dim_x/2]),
+                      np.array([dim_x/2, dim_x/2])],
                      [n_elem, n_elem],
-                     CellType.triangle, dolfinx.cpp.mesh.GhostMode.none)
+                     mesh.CellType.triangle,
+                     ghost_mode=mesh.GhostMode.none)
 
 '''        Incident field, wavenumber and adiabatic absorber functions      '''
 
@@ -117,18 +118,18 @@ def adiabatic_layer(x):
 
 
 # Define function space
-V = FunctionSpace(mesh, ("Lagrange", degree))
+V = fem.functionspace(mesh, ("Lagrange", degree))
 
 # Interpolate wavenumber k onto V
-k = Function(V)
+k = fem.Function(V)
 k.interpolate(wavenumber)
 
 # Interpolate absorbing layer piece of wavenumber k_absorb onto V
-k_absorb = Function(V)
+k_absorb = fem.Function(V)
 k_absorb.interpolate(adiabatic_layer)
 
 # Interpolate incident wave field onto V
-ui = Function(V)
+ui = fem.Function(V)
 ui.interpolate(incident)
 
 # Define variational problem
@@ -141,36 +142,25 @@ a = inner(grad(u), grad(v)) * dx \
 
 L = inner((k**2 - k0**2) * ui, v) * dx
 
-'''           Assemble matrix and vector and set up direct solver           '''
-A = dolfinx.fem.assemble_matrix(a)
-A.assemble()
-b = dolfinx.fem.assemble_vector(L)
-b.ghostUpdate(addv=PETSc.InsertMode.ADD, mode=PETSc.ScatterMode.REVERSE)
-
-solver = PETSc.KSP().create(mesh.mpi_comm())
-opts = PETSc.Options()
-opts["ksp_type"] = "preonly"
-opts["pc_type"] = "lu"
-opts["pc_factor_mat_solver_type"] = "mumps"
-solver.setFromOptions()
-solver.setOperators(A)
+problem = LinearProblem(a, L, petsc_options={"ksp_type": "preonly", "pc_type": "lu", "pc_factor_mat_solver_type": "mumps"},)
 
 # Solve linear system
-u = Function(V)
 start = time.time()
-solver.solve(b, u.vector)
+uh = problem.solve()
 end = time.time()
 time_elapsed = end - start
 print('Solve time: ', time_elapsed)
-u.vector.ghostUpdate(addv=PETSc.InsertMode.INSERT,
+uh.vector.ghostUpdate(addv=PETSc.InsertMode.INSERT,
                      mode=PETSc.ScatterMode.FORWARD)
 
 # Write solution to file
-with XDMFFile(MPI.COMM_WORLD, "sol.xdmf", "w") as file:
+with io.XDMFFile(mesh.comm, "test.xdmf", "w") as file:
+    V1 = fem.functionspace(mesh, ("Lagrange", 1))
+    u1 = fem.Function(V1)
+    u1.interpolate(uh)
     file.write_mesh(mesh)
-    file.write_function(u)
+    file.write_function(u1)
 
-'''            Evaluate field over a specified grid of points              '''
 # Square grid with 10 points per wavelength in each direction
 Nx = int(np.ceil(dim_x/wave_len * 10))
 Ny = Nx
@@ -185,16 +175,26 @@ points = np.vstack((plot_grid[0].ravel(),
                     plot_grid[1].ravel(),
                     np.zeros(plot_grid[0].size)))
 
-# Bounding box tree etc for function evaluations
-tree = geometry.BoundingBoxTree(mesh, 2)
-points_2d = points[0:2, :]
-cell_candidates = [geometry.compute_collisions_point(tree, xi)
-                   for xi in points.T]
-cells = [dolfinx.cpp.geometry.select_colliding_cells(mesh, cell_candidates[i],
-         points.T[i], 1)[0] for i in range(len(cell_candidates))]
+
+# Bounding box tree for function evaluations
+tree = geometry.bb_tree(mesh, mesh.topology.dim)
+points_2d = points[:2, :]
+
+cell_candidates = geometry.compute_collisions_points(tree, points.T)
+colliding_cells = geometry.compute_colliding_cells(
+            mesh, cell_candidates, points.T
+        )
+
+cells = []
+points_on_proc = []
+
+for i, point in enumerate(points.T):
+            if len(colliding_cells.links(i)) > 0:
+                points_on_proc.append(point)
+                cells.append(colliding_cells.links(i)[0])
 
 # Evaluate scattered and incident fields at grid points
-u_sca = u.eval(points.T, cells).reshape((Nx, Ny))
+u_sca = uh.eval(points.T, cells).reshape((Nx, Ny))
 inc_field = incident(points_2d)
 u_inc = inc_field.reshape((Nx, Ny))
 
@@ -219,5 +219,5 @@ fig.savefig('circle_scatter.png')
 k1 = ref_ind * k0
 u_exact = penetrable_circle(k0, k1, radius, plot_grid)
 
-error = np.linalg.norm(u_exact-u_total)/np.linalg.norm(u_exact)
+error = np.linalg.norm(u_exact - u_total) / np.linalg.norm(u_exact)
 print('Relative error = ', error)
