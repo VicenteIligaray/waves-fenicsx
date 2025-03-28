@@ -150,8 +150,6 @@ uh = problem.solve()
 end = time.time()
 time_elapsed = end - start
 print('Solve time: ', time_elapsed)
-uh.vector.ghostUpdate(addv=PETSc.InsertMode.INSERT,
-                     mode=PETSc.ScatterMode.FORWARD)
 
 # Write solution to file
 with io.XDMFFile(mesh.comm, "test.xdmf", "w") as file:
